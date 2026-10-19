@@ -1,0 +1,11 @@
+backend/.env
+.env
+.env.*
+!.env.example
+pass.txt
+node_modules/
+backend/__pycache__/
+__pycache__/
+*.pyc
+.venv/
+venv/

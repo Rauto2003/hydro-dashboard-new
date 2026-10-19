@@ -1,1247 +1,1941 @@
 
-import { useEffect, useState } from "react";
-import "./App.css";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   getSensors,
   getNutrients,
   setNutrient,
+  getActuators,
   controlActuator,
   getAutomation,
   saveAutomation,
+  getCalibration,
+  saveCalibration,
+  getSensorHistory,
+  login,
+  getCurrentUser,
+  logout,
+  getUser,
+  isAdmin,
 } from "./services/api";
 
-const DEFAULT_AUTO = {
-  fan_on: 30,
-  fan_off: 27,
-  cooling_on: 28,
-  cooling_off: 25,
-  fogger_on: 65,
-  fogger_off: 75,
+import {
+  ResponsiveContainer,
+  PieChart,
+  Pie,
+  Cell,
+  Tooltip,
+  Legend,
+} from "recharts";
+
+import "./App.css";
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+const SENSOR_GROUPS = {
+  tank: [
+    {
+      key: "temperature",
+      aliases: [
+        "temperature",
+        "tank_temperature",
+        "water_temperature",
+        "water_temp",
+      ],
+      nestedAliases: [
+        "tank_temperature",
+        "water_temperature",
+        "temperature",
+      ],
+      label: "Water Temperature",
+      unit: "°C",
+      icon: "🌡️",
+    },
+    {
+      key: "ph",
+      aliases: ["ph", "pH", "ph_level", "water_ph", "nutrient_ph"],
+      nestedAliases: ["nutrient_ph", "ph_level", "ph", "pH"],
+      label: "pH Level",
+      unit: "pH",
+      icon: "🧪",
+    },
+    {
+      key: "ec",
+      aliases: [
+        "ec",
+        "EC",
+        "ec_level",
+        "electrical_conductivity",
+        "nutrient_ec",
+      ],
+      nestedAliases: [
+        "nutrient_ec",
+        "electrical_conductivity",
+        "ec_level",
+        "ec",
+        "EC",
+      ],
+      label: "Electrical Conductivity",
+      unit: "mS/cm",
+      icon: "⚡",
+    },
+    {
+      key: "water_level",
+      aliases: ["water_level", "waterLevel", "tank_level"],
+      nestedAliases: ["water_level", "waterLevel", "tank_level"],
+      label: "Water Level",
+      unit: "%",
+      icon: "💧",
+    },
+  ],
+
+  shed: [
+    {
+      key: "air_temperature",
+      aliases: [
+        "air_temperature",
+        "shed_temperature",
+        "air_temp",
+        "temperature",
+      ],
+      nestedAliases: ["air_temperature", "shed_temperature", "air_temp"],
+      label: "Shed Temperature",
+      unit: "°C",
+      icon: "🌤️",
+    },
+    {
+      key: "humidity",
+      aliases: ["humidity", "air_humidity"],
+      nestedAliases: ["humidity", "air_humidity"],
+      label: "Humidity",
+      unit: "%",
+      icon: "💨",
+    },
+  ],
 };
 
-const DEFAULT_TANK = {
-  tank_temperature: null,
-  nutrient_ph: null,
-  nutrient_ec: null,
-  water_level: null,
-};
+const ALL_SENSORS = [
+  ...SENSOR_GROUPS.tank,
+  ...SENSOR_GROUPS.shed,
+];
 
-const DEFAULT_SHADES = {
-  shade_1: {
-    temperature: null,
-    humidity: null,
-    light_intensity: null,
-  },
-};
-
-const DEVICES = [
+const ACTUATORS = [
   {
-    id: "exhaust_fan",
-    name: "Exhaust Fan",
+    key: "cooling",
+    label: "Cooling System",
+    icon: "❄️",
     group: "environment",
-    icon: "✣",
-    description: "Removes hot air from the growing area.",
   },
   {
-    id: "cooling_pump",
-    name: "Cooling Pump",
+    key: "fan",
+    label: "Exhaust Fan",
+    icon: "🌀",
     group: "environment",
-    icon: "❄",
-    description: "Helps reduce growing-area temperature.",
   },
   {
-    id: "fogger",
-    name: "Fogger",
+    key: "fogger",
+    label: "Fogger",
+    icon: "🌫️",
     group: "environment",
-    icon: "☁",
-    description: "Increases humidity in the growing shade.",
   },
   {
-    id: "inlet_pump",
-    name: "Inlet Pump",
+    key: "pump",
+    label: "Water Pump",
+    icon: "🚿",
     group: "tank",
-    icon: "↘",
-    description: "Fills the nutrient tank.",
-  },
-  {
-    id: "outlet_pump",
-    name: "Outlet Pump",
-    group: "tank",
-    icon: "↗",
-    description: "Drains the nutrient tank.",
-  },
-  {
-    id: "reservoir_pump",
-    name: "Reservoir Pump",
-    group: "tank",
-    icon: "⟳",
-    description: "Circulates the nutrient solution.",
   },
 ];
 
-function number(value, decimals = 1) {
-  if (
-    value === null ||
-    value === undefined ||
-    value === "" ||
-    !Number.isFinite(Number(value))
-  ) {
-    return "--";
+const DEFAULT_AUTOMATION = {
+  cooling_off: 25,
+  cooling_on: 28,
+  fan_off: 27,
+  fan_on: 30,
+  fogger_off: 75,
+  fogger_on: 65,
+};
+
+const DEFAULT_CALIBRATION = {
+  ph_offset: 0,
+  ec_offset: 0,
+  temperature_offset: 0,
+};
+
+const DEFAULT_NUTRIENTS = {
+  A: 0,
+  B: 0,
+  C: 0,
+};
+
+const HISTORY_COLORS = [
+  "#16a34a",
+  "#0ea5e9",
+  "#f59e0b",
+  "#8b5cf6",
+  "#ef4444",
+  "#64748b",
+];
+
+const NAV_ITEMS = [
+  { key: "dashboard", label: "Dashboard", icon: "▦" },
+  { key: "control", label: "Control", icon: "⚙" },
+  { key: "calibration", label: "Calibration", icon: "⌁" },
+  { key: "history", label: "History", icon: "◷" },
+];
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+
+function unwrapObject(response, preferredKeys = []) {
+  if (!response || typeof response !== "object") return {};
+
+  for (const key of preferredKeys) {
+    if (
+      response[key] &&
+      typeof response[key] === "object" &&
+      !Array.isArray(response[key])
+    ) {
+      return response[key];
+    }
   }
 
-  return Number(value).toFixed(decimals);
+  return response;
 }
 
-function average(shades, field) {
-  const values = Object.values(shades)
-    .map((shade) => shade?.[field])
-    .filter(
-      (value) =>
-        value !== null &&
-        value !== undefined &&
-        value !== "" &&
-        Number.isFinite(Number(value))
-    )
-    .map(Number);
-
-  if (!values.length) return null;
-
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
-function extractSensorData(response) {
-  let data = response;
-
-  for (let i = 0; i < 3; i += 1) {
-    if (!data || typeof data !== "object") break;
-
-    if (data.received && typeof data.received === "object") {
-      data = data.received;
-      continue;
-    }
-
-    if (data.sensors && typeof data.sensors === "object") {
-      data = data.sensors;
-      continue;
-    }
-
-    break;
+function getLatestSensorRecord(response) {
+  if (Array.isArray(response)) {
+    return response[response.length - 1] || {};
   }
 
-  return data || {};
+  if (!response || typeof response !== "object") {
+    return {};
+  }
+
+  if (Array.isArray(response.data)) {
+    return response.data[response.data.length - 1] || {};
+  }
+
+  if (response.data && typeof response.data === "object") {
+    return response.data;
+  }
+
+  if (response.latest && typeof response.latest === "object") {
+    return response.latest;
+  }
+
+  return response;
 }
 
-function App() {
-  const [page, setPage] = useState("Dashboard");
+function readAliases(source, aliases) {
+  if (!source || typeof source !== "object") {
+    return undefined;
+  }
 
+  for (const alias of aliases) {
+    const value = source[alias];
+
+    if (
+      value !== undefined &&
+      value !== null &&
+      value !== ""
+    ) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function getSensorValue(record, sensor) {
+  if (!record || typeof record !== "object") {
+    return undefined;
+  }
+
+  const directValue = readAliases(record, sensor.aliases);
+
+  if (directValue !== undefined) {
+    return directValue;
+  }
+
+  const nestedSources = [
+    record.nutrient_tank,
+    record.tank,
+    record.sensors,
+    record.data,
+    record.environment,
+  ];
+
+  for (const nested of nestedSources) {
+    const value = readAliases(
+      nested,
+      sensor.nestedAliases || sensor.aliases
+    );
+
+    if (value !== undefined) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function displayValue(value, unit = "") {
+  if (value === undefined || value === null || value === "") {
+    return "—";
+  }
+
+  const number = Number(value);
+
+  const formatted = Number.isFinite(number)
+    ? number.toLocaleString("en-IN", {
+        maximumFractionDigits: 2,
+      })
+    : String(value);
+
+  return `${formatted}${unit ? ` ${unit}` : ""}`;
+}
+
+function formatLabel(value) {
+  return String(value)
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function formatTimestamp(record) {
+  const value =
+    record?.timestamp ??
+    record?.created_at ??
+    record?.time ??
+    record?.date;
+
+  if (!value) return "—";
+
+  const date = new Date(value);
+
+  return Number.isNaN(date.getTime())
+    ? String(value)
+    : date.toLocaleString("en-IN");
+}
+
+function isActuatorOn(value) {
+  if (value === true || value === 1) return true;
+
+  if (typeof value === "string") {
+    return ["on", "true", "1", "active", "running"].includes(
+      value.toLowerCase()
+    );
+  }
+
+  return false;
+}
+
+// ============================================================
+// REUSABLE COMPONENTS
+// ============================================================
+
+function SectionHeading({ eyebrow, title, description }) {
+  return (
+    <div className="section-heading">
+      <div>
+        {eyebrow && <p className="eyebrow">{eyebrow}</p>}
+        <h2>{title}</h2>
+
+        {description && (
+          <p className="section-description">{description}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SensorCard({ sensor, value }) {
+  const missing =
+    value === undefined || value === null || value === "";
+
+  return (
+    <article className="sensor-card" key={sensor.key}>
+      <div className="sensor-card-top">
+        <span className="sensor-icon">{sensor.icon}</span>
+
+        <span
+          className={`sensor-live-dot ${
+            missing ? "sensor-dot-muted" : ""
+          }`}
+          title={
+            missing
+              ? "No reading available"
+              : "Reading available"
+          }
+        />
+      </div>
+
+      <p className="sensor-label">{sensor.label}</p>
+
+      <h3 className="sensor-value">
+        {displayValue(value, sensor.unit)}
+      </h3>
+
+      <p className="sensor-caption">
+        {missing ? "Waiting for sensor data" : "Latest reading"}
+      </p>
+    </article>
+  );
+}
+
+function LoginScreen({ onLogin, busy, error }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [loggedIn, setLoggedIn] = useState(
-    () => sessionStorage.getItem("hydro_logged_in") === "true"
+  const [showPassword, setShowPassword] = useState(false);
+
+  async function submit(event) {
+    event.preventDefault();
+
+    if (!username.trim() || !password) return;
+
+    await onLogin(username.trim(), password);
+  }
+
+  return (
+    <div className="login-screen">
+      <div className="login-card">
+        <div className="login-brand-icon">🌱</div>
+
+        <p className="eyebrow">SMART AGRICULTURE</p>
+
+        <h1>Welcome to HYDRO</h1>
+
+        <p className="login-description">
+          Monitor your hydroponics system and manage your
+          greenhouse from one dashboard.
+        </p>
+
+        {error && (
+          <div className="alert alert-error" role="alert">
+            {error}
+          </div>
+        )}
+
+        <form
+          className="settings-form login-form"
+          onSubmit={submit}
+        >
+          <label className="field">
+            <span>Username</span>
+
+            <input
+              autoComplete="username"
+              value={username}
+              onChange={(event) =>
+                setUsername(event.target.value)
+              }
+              placeholder="Enter username"
+              required
+            />
+          </label>
+
+          <label className="field">
+            <span>Password</span>
+
+            <div className="password-input-wrap">
+              <input
+                type={showPassword ? "text" : "password"}
+                autoComplete="current-password"
+                value={password}
+                onChange={(event) =>
+                  setPassword(event.target.value)
+                }
+                placeholder="Enter password"
+                required
+              />
+
+              <button
+                className="password-toggle"
+                type="button"
+                onClick={() =>
+                  setShowPassword((current) => !current)
+                }
+              >
+                {showPassword ? "Hide" : "Show"}
+              </button>
+            </div>
+          </label>
+
+          <button
+            className="button button-primary login-submit"
+            type="submit"
+            disabled={busy}
+          >
+            {busy ? "Signing in…" : "Sign in"}
+          </button>
+        </form>
+
+        <p className="login-footnote">
+          Local testing account
+        </p>
+      </div>
+    </div>
   );
+}
+
+// ============================================================
+// MAIN APPLICATION
+// ============================================================
+
+function App() {
+  const [user, setUser] = useState(() => getUser());
+
+  const [authChecking, setAuthChecking] = useState(
+    Boolean(getUser())
+  );
+
+  const [loginBusy, setLoginBusy] = useState(false);
   const [loginError, setLoginError] = useState("");
 
-  const [shades, setShades] = useState(DEFAULT_SHADES);
-  const [tank, setTank] = useState(DEFAULT_TANK);
+  const [page, setPage] = useState("dashboard");
+  const [controlExpanded, setControlExpanded] = useState(false);
+  const [controlPage, setControlPage] = useState("environment");
 
-  const [nutrients, setNutrients] = useState({
-    A: 0,
-    B: 0,
-    C: 0,
-  });
+  const [sensors, setSensors] = useState({});
+  const [nutrients, setNutrients] = useState(DEFAULT_NUTRIENTS);
 
-  const [doses, setDoses] = useState({
-    A: "0",
-    B: "0",
-    C: "0",
-  });
-
-  const [automation, setAutomation] = useState(DEFAULT_AUTO);
-
-  const [devices, setDevices] = useState(() =>
-    Object.fromEntries(
-      DEVICES.map((device) => [
-        device.id,
-        { state: "OFF", mode: "MANUAL" },
-      ])
-    )
+  const [automation, setAutomation] = useState(
+    DEFAULT_AUTOMATION
   );
+
+  const [actuatorStates, setActuatorStates] = useState({});
+
+  const [calibration, setCalibration] = useState(
+    DEFAULT_CALIBRATION
+  );
+
+  const [history, setHistory] = useState([]);
+
+  const [historyFilters, setHistoryFilters] = useState({
+    from_date: "",
+    to_date: "",
+    from_time: "",
+    to_time: "",
+  });
 
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
-  const [message, setMessage] = useState("");
+  const [notice, setNotice] = useState("");
   const [lastUpdated, setLastUpdated] = useState(null);
 
-  function notify(text, isError = false) {
-    setMessage(isError ? "" : text);
-    setError(isError ? text : "");
-  }
+  const admin = Boolean(
+    user &&
+      (user.role === "admin" || isAdmin())
+  );
 
-  function login(event) {
-    event.preventDefault();
+  const showNotice = useCallback((message) => {
+    setNotice(message);
 
-    if (username.trim() !== "admin" || password !== "admin123") {
-      setLoginError("Invalid username or password.");
-      return;
-    }
+    window.setTimeout(() => {
+      setNotice("");
+    }, 3500);
+  }, []);
 
-    sessionStorage.setItem("hydro_logged_in", "true");
-    setLoggedIn(true);
-    setLoginError("");
-    setPage("Dashboard");
-  }
-
-  function logout() {
-    sessionStorage.removeItem("hydro_logged_in");
-    setLoggedIn(false);
-    setUsername("");
-    setPassword("");
-    setPage("Dashboard");
-    setMessage("");
-    setError("");
-  }
-
-  async function refreshData() {
-    try {
-      const response = await getSensors();
-      const data = extractSensorData(response);
-
-      console.log("HydroControl API response:", response);
-
-      const shadeData = data.shades?.shade_1;
-
-      if (shadeData && typeof shadeData === "object") {
-        setShades({
-          shade_1: {
-            temperature: shadeData.temperature ?? null,
-            humidity: shadeData.humidity ?? null,
-            light_intensity: shadeData.light_intensity ?? null,
-          },
-        });
-      } else {
-        setShades({
-          shade_1: {
-            temperature: data.shed_temperature ?? data.temperature ?? null,
-            humidity: data.humidity ?? null,
-            light_intensity: data.light_intensity ?? null,
-          },
-        });
-      }
-
-      const tankData = data.nutrient_tank;
-
-      if (tankData && typeof tankData === "object") {
-        setTank({
-          tank_temperature: tankData.tank_temperature ?? null,
-          nutrient_ph: tankData.nutrient_ph ?? null,
-          nutrient_ec: tankData.nutrient_ec ?? null,
-          water_level: tankData.water_level ?? null,
-        });
-      } else {
-        setTank(DEFAULT_TANK);
-      }
-
-      setLastUpdated(new Date().toLocaleTimeString());
-      setError("");
-
-      try {
-        const nutrientResponse = await getNutrients();
-        const nutrientData =
-          nutrientResponse?.nutrients ?? nutrientResponse ?? {};
-
-        setNutrients((old) => ({
-          ...old,
-          ...nutrientData,
-        }));
-
-        setDoses((old) => ({
-          ...old,
-          ...Object.fromEntries(
-            ["A", "B", "C"]
-              .filter((key) => nutrientData[key] !== undefined)
-              .map((key) => [key, String(nutrientData[key])])
-          ),
-        }));
-      } catch (err) {
-        console.warn("Nutrient endpoint unavailable:", err.message);
-      }
-    } catch (err) {
-      console.error("Sensor refresh failed:", err);
-      setError(
-        `Unable to reach the API. Check your backend. ${err.message || ""}`
-      );
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function refreshAutomation() {
-    try {
-      const response = await getAutomation();
-      const settings = response?.settings ?? response ?? {};
-
-      setAutomation((old) => ({
-        ...old,
-        ...settings,
-      }));
-    } catch (err) {
-      console.warn("Automation endpoint unavailable:", err.message);
-    }
-  }
+  // ----------------------------------------------------------
+  // LOGIN
+  // ----------------------------------------------------------
 
   useEffect(() => {
-    if (!loggedIn) {
+    let active = true;
+
+    async function verifySession() {
+      if (!getUser()) {
+        if (active) setAuthChecking(false);
+        return;
+      }
+
+      try {
+        const result = await getCurrentUser();
+
+        if (active && result) {
+          setUser(result.user ?? result);
+        }
+      } catch {
+        if (active) {
+          logout();
+          setUser(null);
+        }
+      } finally {
+        if (active) {
+          setAuthChecking(false);
+        }
+      }
+    }
+
+    verifySession();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleLogin = async (username, password) => {
+    setLoginBusy(true);
+    setLoginError("");
+
+    try {
+      // Temporary local credentials:
+      // username: admin
+      // password: admin123
+      if (
+        username !== "admin" ||
+        password !== "admin123"
+      ) {
+        throw new Error("Invalid username or password.");
+      }
+
+      const result = await login(username, password);
+      const loggedInUser = result?.user ?? getUser();
+
+      if (!loggedInUser) {
+        throw new Error("Could not load user details.");
+      }
+
+      setUser({
+        ...loggedInUser,
+        username: loggedInUser.username || "admin",
+        role: "admin",
+      });
+
+      setPage("dashboard");
+      setError("");
+      setNotice("Welcome to HYDRO!");
+    } catch (err) {
+      setLoginError(
+        err?.message || "Unable to sign in."
+      );
+    } finally {
+      setLoginBusy(false);
+    }
+  };
+
+  const handleLogout = () => {
+    logout();
+
+    setUser(null);
+    setPage("dashboard");
+    setSensors({});
+    setNutrients(DEFAULT_NUTRIENTS);
+    setHistory([]);
+    setActuatorStates({});
+    setError("");
+    setNotice("");
+  };
+
+  // ----------------------------------------------------------
+  // LOAD DASHBOARD DATA
+  // ----------------------------------------------------------
+
+  const loadDashboard = useCallback(
+    async (showLoading = false) => {
+      if (!user) return;
+
+      if (showLoading) {
+        setLoading(true);
+      }
+
+      try {
+        const results = await Promise.allSettled([
+          getSensors(),
+          getNutrients(),
+          getAutomation(),
+          getActuators(),
+        ]);
+
+        if (results[0].status === "fulfilled") {
+          setSensors(
+            getLatestSensorRecord(results[0].value)
+          );
+
+          setLastUpdated(new Date());
+        } else {
+          throw results[0].reason;
+        }
+
+        if (results[1].status === "fulfilled") {
+          const values = unwrapObject(
+            results[1].value,
+            ["nutrients", "data"]
+          );
+
+          setNutrients((current) => ({
+            ...current,
+            ...values,
+          }));
+        }
+
+        if (results[2].status === "fulfilled") {
+          const settings = unwrapObject(
+            results[2].value,
+            ["settings", "automation", "data"]
+          );
+
+          setAutomation((current) => ({
+            ...current,
+            ...settings,
+          }));
+        }
+
+        if (results[3].status === "fulfilled") {
+          const states = unwrapObject(
+            results[3].value,
+            ["actuators", "states", "data"]
+          );
+
+          setActuatorStates((current) => ({
+            ...current,
+            ...states,
+          }));
+        }
+
+        setError("");
+      } catch (err) {
+        setError(
+          `Unable to load dashboard data. Check your backend connection. ${
+            err?.message || ""
+          }`
+        );
+      } finally {
+        setLoading(false);
+      }
+    },
+    [user]
+  );
+
+  useEffect(() => {
+    if (!user) {
       setLoading(false);
       return undefined;
     }
 
-    refreshData();
-    refreshAutomation();
+    loadDashboard(true);
 
-    const timer = setInterval(() => {
-      refreshData();
+    const interval = window.setInterval(() => {
+      loadDashboard(false);
     }, 5000);
 
-    return () => clearInterval(timer);
-  }, [loggedIn]);
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [user, loadDashboard]);
 
-  async function toggleDevice(device) {
-    const current = devices[device.id] || { state: "OFF" };
-    const next = current.state === "ON" ? "OFF" : "ON";
+  // ----------------------------------------------------------
+  // NAVIGATION
+  // ----------------------------------------------------------
 
-    setBusy(device.id);
+  const navigate = (nextPage) => {
+    setPage(nextPage);
+    setError("");
+    setNotice("");
+
+    if (nextPage === "control") {
+      setControlExpanded(true);
+    }
+  };
+
+  const openControl = (tab) => {
+    setPage("control");
+    setControlExpanded(true);
+    setControlPage(tab);
+    setError("");
+    setNotice("");
+  };
+
+  // ----------------------------------------------------------
+  // ACTUATOR CONTROL
+  // ----------------------------------------------------------
+
+  const handleActuator = async (name, nextState) => {
+    setBusy(name);
+    setError("");
 
     try {
-      await controlActuator(device.id, next);
+      await controlActuator(name, nextState);
 
-      setDevices((old) => ({
-        ...old,
-        [device.id]: {
-          state: next,
-          mode: "MANUAL",
-        },
+      setActuatorStates((current) => ({
+        ...current,
+        [name]: nextState,
       }));
 
-      notify(`${device.name}: ${next} command sent.`);
+      showNotice(
+        `${formatLabel(name)} command sent.`
+      );
+
+      // Refresh actual actuator states from backend.
+      try {
+        const result = await getActuators();
+
+        setActuatorStates(
+          unwrapObject(result, [
+            "actuators",
+            "states",
+            "data",
+          ])
+        );
+      } catch {
+        // Keep the locally updated state if refresh fails.
+      }
     } catch (err) {
-      notify(`Device command failed: ${err.message}`, true);
+      setError(
+        `Could not control ${name}: ${err.message}`
+      );
     } finally {
       setBusy("");
     }
-  }
+  };
 
-  async function sendDose(letter) {
-    const dose = Number(doses[letter]);
+  // ----------------------------------------------------------
+  // NUTRIENT CONTROL
+  // ----------------------------------------------------------
 
-    if (
-      doses[letter].trim() === "" ||
-      !Number.isFinite(dose) ||
-      dose < 0
-    ) {
-      notify("Enter a valid non-negative dose.", true);
+  const handleNutrient = async (name, value) => {
+    const number = Number(value);
+
+    if (!Number.isFinite(number)) {
+      setError("Enter a valid nutrient value.");
       return;
     }
 
-    setBusy(`dose-${letter}`);
+    setBusy(`nutrient-${name}`);
+    setError("");
 
     try {
-      await setNutrient(letter, dose);
+      await setNutrient(name, number);
 
-      setNutrients((old) => ({
-        ...old,
-        [letter]: dose,
+      setNutrients((current) => ({
+        ...current,
+        [name]: number,
       }));
 
-      notify(`Nutrient ${letter} dose saved.`);
+      showNotice(
+        `${formatLabel(name)} updated successfully.`
+      );
     } catch (err) {
-      notify(`Unable to save dose: ${err.message}`, true);
+      setError(
+        `Could not update nutrient: ${err.message}`
+      );
     } finally {
       setBusy("");
     }
-  }
+  };
 
-  async function submitAutomation(event) {
+  // ----------------------------------------------------------
+  // AUTOMATION
+  // ----------------------------------------------------------
+
+  const handleAutomationSave = async (event) => {
     event.preventDefault();
 
-    const values = Object.fromEntries(
-      Object.entries(automation).map(([key, value]) => [key, Number(value)])
-    );
-
-    if (
-      Object.values(values).some((value) => !Number.isFinite(value)) ||
-      values.fan_off >= values.fan_on ||
-      values.cooling_off >= values.cooling_on ||
-      values.fogger_on >= values.fogger_off
-    ) {
-      notify("Check your automation thresholds.", true);
+    if (!admin) {
+      setError(
+        "Only an Admin can update automation settings."
+      );
       return;
+    }
+
+    const numericSettings = {};
+
+    for (const [key, value] of Object.entries(automation)) {
+      const number = Number(value);
+
+      if (value === "" || !Number.isFinite(number)) {
+        setError(
+          `Enter a valid value for ${formatLabel(key)}.`
+        );
+        return;
+      }
+
+      numericSettings[key] = number;
     }
 
     setBusy("automation");
+    setError("");
 
     try {
-      const response = await saveAutomation(values);
+      await saveAutomation(numericSettings);
 
-      setAutomation((old) => ({
-        ...old,
-        ...(response?.settings ?? values),
-      }));
+      setAutomation(numericSettings);
 
-      notify("Automation settings saved.");
+      showNotice("Automation settings saved.");
     } catch (err) {
-      notify(`Unable to save automation: ${err.message}`, true);
+      setError(
+        `Could not save automation settings: ${err.message}`
+      );
     } finally {
       setBusy("");
     }
-  }
+  };
 
-  function renderShade(shadeId, shade) {
-    const label = shadeId.replace("_", " ").toUpperCase();
+  // ----------------------------------------------------------
+  // CALIBRATION
+  // ----------------------------------------------------------
 
-    return (
-      <article className="shade-card" key={shadeId}>
-        <div className="shade-card-header">
-          <div className="metric-icon plant-icon">♧</div>
-          <span className={`status-badge ${error ? "offline" : "online"}`}>
-            <i />
-            {error ? "CONNECTION ISSUE" : "LIVE SENSOR"}
-          </span>
-        </div>
+  const loadCalibration = async () => {
+    setBusy("calibration-load");
+    setError("");
 
-        <h3>{label}</h3>
-        <p className="muted">Growing environment</p>
+    try {
+      const result = await getCalibration();
 
-        <div className="shade-metrics">
-          <div className="shade-metric">
-            <div className="metric-icon temperature-icon">♨</div>
-            <div>
-              <span>Temperature</span>
-              <strong>{number(shade.temperature)} °C</strong>
+      const values = unwrapObject(result, [
+        "calibration",
+        "data",
+      ]);
+
+      setCalibration({
+        ...DEFAULT_CALIBRATION,
+        ...values,
+      });
+
+      showNotice("Calibration values loaded.");
+    } catch (err) {
+      setError(
+        `Could not load calibration: ${err.message}`
+      );
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const handleCalibrationSave = async (event) => {
+    event.preventDefault();
+
+    if (!admin) {
+      setError(
+        "Only an Admin can update calibration settings."
+      );
+      return;
+    }
+
+    const payload = {};
+
+    for (const key of Object.keys(DEFAULT_CALIBRATION)) {
+      const value = calibration[key] ?? 0;
+      const number = Number(value);
+
+      if (!Number.isFinite(number)) {
+        setError(
+          `Enter a valid value for ${formatLabel(key)}.`
+        );
+        return;
+      }
+
+      payload[key] = number;
+    }
+
+    setBusy("calibration-save");
+    setError("");
+
+    try {
+      await saveCalibration(payload);
+
+      setCalibration(payload);
+
+      showNotice("Calibration settings saved.");
+    } catch (err) {
+      setError(
+        `Could not save calibration: ${err.message}`
+      );
+    } finally {
+      setBusy("");
+    }
+  };
+
+  // ----------------------------------------------------------
+  // SENSOR HISTORY
+  // ----------------------------------------------------------
+
+  const loadHistory = async (event) => {
+    event?.preventDefault();
+
+    setBusy("history");
+    setError("");
+
+    try {
+      const params = Object.fromEntries(
+        Object.entries(historyFilters).filter(
+          ([, value]) => Boolean(value)
+        )
+      );
+
+      const result = await getSensorHistory(params);
+
+      const records = Array.isArray(result)
+        ? result
+        : result?.history ??
+          result?.data ??
+          result?.records ??
+          [];
+
+      setHistory(
+        Array.isArray(records) ? records : []
+      );
+
+      showNotice(
+        `Loaded ${
+          Array.isArray(records) ? records.length : 0
+        } history records.`
+      );
+    } catch (err) {
+      setError(
+        `Could not load sensor history: ${err.message}`
+      );
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const historySummary = useMemo(() => {
+    return ALL_SENSORS.map((sensor) => {
+      const count = history.filter((record) => {
+        const value = getSensorValue(record, sensor);
+
+        return (
+          value !== undefined &&
+          value !== null &&
+          value !== ""
+        );
+      }).length;
+
+      return {
+        name: sensor.label,
+        value: count,
+      };
+    }).filter((item) => item.value > 0);
+  }, [history]);
+
+  // ----------------------------------------------------------
+  // ACTUATOR CARDS
+  // ----------------------------------------------------------
+
+  const renderActuators = (group) => (
+    <div className="actuator-grid">
+      {ACTUATORS.filter(
+        (actuator) => actuator.group === group
+      ).map((actuator) => {
+        const isOn = isActuatorOn(
+          actuatorStates[actuator.key]
+        );
+
+        return (
+          <article
+            className="actuator-card"
+            key={actuator.key}
+          >
+            <span className="actuator-icon">
+              {actuator.icon}
+            </span>
+
+            <div className="actuator-info">
+              <strong>{actuator.label}</strong>
+
+              <span
+                className={
+                  isOn ? "state-on" : "state-off"
+                }
+              >
+                {isOn ? "ON" : "OFF"}
+              </span>
             </div>
-          </div>
 
-          <div className="shade-metric">
-            <div className="metric-icon humidity-icon">◉</div>
-            <div>
-              <span>Humidity</span>
-              <strong>{number(shade.humidity, 0)}%</strong>
-            </div>
-          </div>
+            <button
+              className={`button ${
+                isOn
+                  ? "button-danger"
+                  : "button-primary"
+              }`}
+              type="button"
+              onClick={() =>
+                handleActuator(
+                  actuator.key,
+                  isOn ? "OFF" : "ON"
+                )
+              }
+              disabled={busy === actuator.key}
+            >
+              {busy === actuator.key
+                ? "Sending…"
+                : isOn
+                  ? "Turn off"
+                  : "Turn on"}
+            </button>
+          </article>
+        );
+      })}
+    </div>
+  );
 
-          <div className="shade-metric">
-            <div className="metric-icon light-icon">☼</div>
-            <div>
-              <span>Light intensity</span>
-              <strong>{number(shade.light_intensity, 0)}</strong>
-            </div>
-          </div>
-        </div>
-      </article>
-    );
-  }
+  // ----------------------------------------------------------
+  // DASHBOARD PAGE
+  // ----------------------------------------------------------
 
-  function renderDevice(device) {
-    const current = devices[device.id] || { state: "OFF" };
-    const isOn = current.state === "ON";
-
-    return (
-      <article className="device-card" key={device.id}>
-        <div className="device-card-top">
-          <div className="device-icon">{device.icon}</div>
-          <span className={`state-pill ${isOn ? "on" : ""}`}>
-            <i />
-            {current.state}
-          </span>
-        </div>
-
-        <h3>{device.name}</h3>
-        <p className="device-description">{device.description}</p>
-
-        <div className="device-meta">
-          <span>Control mode</span>
-          <strong>MANUAL</strong>
-        </div>
-
-        <button
-          type="button"
-          className={`button ${
-            isOn ? "button-stop" : "button-primary"
-          } full-width`}
-          disabled={busy === device.id}
-          onClick={() => toggleDevice(device)}
-        >
-          {busy === device.id
-            ? "Sending command..."
-            : `Turn ${isOn ? "OFF" : "ON"}`}
-        </button>
-      </article>
-    );
-  }
-
-  function renderDose(letter) {
-    return (
-      <article className="nutrient-card" key={letter}>
-        <div className={`nutrient-letter nutrient-${letter}`}>{letter}</div>
-
-        <div className="nutrient-info">
-          <h3>Nutrient {letter}</h3>
-          <p>Liquid nutrient dosing</p>
-        </div>
-
-        <label htmlFor={`dose-${letter}`}>Dose rate</label>
-
-        <div className="input-with-unit">
-          <input
-            id={`dose-${letter}`}
-            type="number"
-            min="0"
-            step="0.1"
-            value={doses[letter]}
-            onChange={(event) =>
-              setDoses((old) => ({
-                ...old,
-                [letter]: event.target.value,
-              }))
-            }
-          />
-          <span>ml/min</span>
-        </div>
-
-        <div className="last-dose">
-          Last saved: {number(nutrients[letter])} ml/min
-        </div>
-
-        <button
-          type="button"
-          className="button button-primary full-width"
-          disabled={busy === `dose-${letter}`}
-          onClick={() => sendDose(letter)}
-        >
-          {busy === `dose-${letter}` ? "Saving..." : "Save dose"}
-        </button>
-      </article>
-    );
-  }
-
-  const shade1 = shades.shade_1;
-  const avgTemperature = average(shades, "temperature");
-  const avgHumidity = average(shades, "humidity");
-
-  const waterLevel =
-    tank.water_level === null ||
-    tank.water_level === undefined ||
-    tank.water_level === ""
-      ? null
-      : Number(tank.water_level);
-
-  const validWaterLevel =
-    waterLevel !== null && Number.isFinite(waterLevel);
-
-  const waterPercent = validWaterLevel
-    ? Math.max(0, Math.min(100, waterLevel))
-    : 0;
-
-  const waterLevelText = !validWaterLevel
-    ? "NO DATA"
-    : waterLevel >= 90
-      ? "FULL"
-      : waterLevel >= 60
-        ? "NORMAL"
-        : waterLevel >= 30
-          ? "LOW"
-          : "VERY LOW";
-
-  if (!loggedIn) {
-    return (
-      <div className="login-page">
-        <div className="login-decoration decoration-one" />
-        <div className="login-decoration decoration-two" />
-
-        <form className="login-card" onSubmit={login}>
-          <div className="login-mark">H</div>
-          <p className="eyebrow">SMART HYDROPONICS SYSTEM</p>
-          <h1>Welcome back</h1>
-          <p className="login-description">
-            Sign in to access your HydroControl dashboard.
+  const renderDashboard = () => (
+    <>
+      <div className="welcome-row">
+        <div>
+          <p className="eyebrow">
+            HYDROPONICS MONITORING
           </p>
 
-          <div className="login-demo-info">
-            <strong>Demo credentials</strong>
-            <p>Username: admin</p>
-            <p>Password: admin123</p>
-          </div>
+          <h1>Greenhouse Dashboard</h1>
 
-          <label className="form-field">
-            <span>Username</span>
-            <input
-              value={username}
-              onChange={(event) => setUsername(event.target.value)}
-              autoComplete="username"
-              required
+          <p className="welcome-description">
+            Monitor your nutrient tank, greenhouse environment,
+            and hydroponics system.
+          </p>
+        </div>
+
+        <button
+          className="button button-secondary"
+          type="button"
+          onClick={() => loadDashboard(true)}
+          disabled={loading}
+        >
+          ↻ {loading ? "Refreshing…" : "Refresh"}
+        </button>
+      </div>
+
+      <section className="panel">
+        <SectionHeading
+          eyebrow="WATER SYSTEM"
+          title="Tank Parameters"
+          description="Latest readings from your nutrient tank."
+        />
+
+        <div className="sensor-grid tank-sensor-grid">
+          {SENSOR_GROUPS.tank.map((sensor) => (
+            <SensorCard
+              key={sensor.key}
+              sensor={sensor}
+              value={getSensorValue(sensors, sensor)}
             />
-          </label>
+          ))}
+        </div>
 
-          <label className="form-field">
-            <span>Password</span>
-            <input
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              autoComplete="current-password"
-              required
+        <div className="shed-heading">
+          <SectionHeading
+            eyebrow="GROWING ENVIRONMENT"
+            title="Shed Parameters"
+            description="Latest readings from your growing shed."
+          />
+        </div>
+
+        <div className="sensor-grid shed-sensor-grid">
+          {SENSOR_GROUPS.shed.map((sensor) => (
+            <SensorCard
+              key={sensor.key}
+              sensor={sensor}
+              value={getSensorValue(sensors, sensor)}
             />
-          </label>
+          ))}
+        </div>
 
-          {loginError && <p className="login-error">{loginError}</p>}
+        <div className="sensor-footer">
+          <span>
+            <span className="status-dot" />
+            Live sensor polling
+          </span>
 
-          <button className="button button-primary full-width" type="submit">
-            Sign in to dashboard →
+          <span>
+            Last updated:{" "}
+            {lastUpdated
+              ? lastUpdated.toLocaleTimeString("en-IN")
+              : "—"}
+          </span>
+        </div>
+
+        {loading && (
+          <p className="muted-text">
+            Loading sensor readings…
+          </p>
+        )}
+      </section>
+
+      {/* NUTRIENT VALUES */}
+
+      <section className="panel">
+        <SectionHeading
+          eyebrow="NUTRIENT MANAGEMENT"
+          title="Nutrient Values"
+          description="Nutrient values received from your backend."
+        />
+
+        <div className="nutrient-grid">
+          {Object.entries(nutrients).map(([name, value]) => (
+            <article className="nutrient-card" key={name}>
+              <span className="nutrient-name">
+                {formatLabel(name)}
+              </span>
+
+              <strong>
+                {value !== null &&
+                typeof value === "object"
+                  ? JSON.stringify(value)
+                  : String(value ?? "—")}
+              </strong>
+            </article>
+          ))}
+        </div>
+
+        <p className="muted-text">
+          Values shown here come from the backend. The initial
+          A, B, and C values are placeholders until actual
+          nutrient values are returned.
+        </p>
+      </section>
+
+      {/* QUICK ACCESS */}
+
+      <section className="panel">
+        <SectionHeading
+          eyebrow="SYSTEM MANAGEMENT"
+          title="Quick Access"
+          description="Open controls for your greenhouse or nutrient tank."
+        />
+
+        <div className="quick-link-grid">
+          <button
+            className="quick-link-card"
+            type="button"
+            onClick={() => openControl("environment")}
+          >
+            <span className="quick-link-icon">🌿</span>
+
+            <span className="quick-link-copy">
+              <strong>Environment Control</strong>
+              <small>
+                Cooling, fan, fogger and automation
+              </small>
+            </span>
+
+            <span className="quick-link-arrow">→</span>
           </button>
 
-          <p className="login-footnote">
-            HydroControl · Smart growing, made simpler
-          </p>
+          <button
+            className="quick-link-card"
+            type="button"
+            onClick={() => openControl("tank")}
+          >
+            <span className="quick-link-icon">💧</span>
+
+            <span className="quick-link-copy">
+              <strong>Tank Control</strong>
+              <small>Water pump and nutrient dosing</small>
+            </span>
+
+            <span className="quick-link-arrow">→</span>
+          </button>
+        </div>
+      </section>
+    </>
+  );
+
+  // ----------------------------------------------------------
+  // ENVIRONMENT CONTROL PAGE
+  // ----------------------------------------------------------
+
+  const renderEnvironmentControl = () => (
+    <>
+      <SectionHeading
+        eyebrow="CONTROL / ENVIRONMENT"
+        title="Environment Control"
+        description="Manage greenhouse actuators and automatic thresholds."
+      />
+
+      <section className="panel">
+        <h3 className="panel-title">
+          Manual Environment Control
+        </h3>
+
+        <p className="muted-text">
+          Send ON or OFF commands to your environment actuators.
+        </p>
+
+        {renderActuators("environment")}
+      </section>
+
+      <section className="panel">
+        <h3 className="panel-title">
+          Automation Settings
+        </h3>
+
+        <p className="muted-text">
+          Configure automatic control thresholds.
+        </p>
+
+        <form
+          className="settings-form"
+          onSubmit={handleAutomationSave}
+        >
+          {Object.entries(automation).map(([key, value]) => (
+            <label className="field" key={key}>
+              <span>{formatLabel(key)}</span>
+
+              <input
+                type="number"
+                step="0.1"
+                value={value ?? ""}
+                onChange={(event) =>
+                  setAutomation((current) => ({
+                    ...current,
+                    [key]:
+                      event.target.value === ""
+                        ? ""
+                        : Number(event.target.value),
+                  }))
+                }
+              />
+            </label>
+          ))}
+
+          <button
+            className="button button-primary"
+            type="submit"
+            disabled={busy === "automation"}
+          >
+            {busy === "automation"
+              ? "Saving…"
+              : "Save automation settings"}
+          </button>
         </form>
+      </section>
+    </>
+  );
+
+  // ----------------------------------------------------------
+  // TANK CONTROL PAGE
+  // ----------------------------------------------------------
+
+  const renderTankControl = () => (
+    <>
+      <SectionHeading
+        eyebrow="CONTROL / TANK"
+        title="Tank Control"
+        description="Control the water pump and update nutrient values."
+      />
+
+      <section className="panel">
+        <h3 className="panel-title">Water Pump</h3>
+
+        <p className="muted-text">
+          Send commands to your configured water pump.
+        </p>
+
+        {renderActuators("tank")}
+      </section>
+
+      <section className="panel">
+        <h3 className="panel-title">
+          Nutrient Dosing
+        </h3>
+
+        <p className="muted-text">
+          Edit the nutrient values supported by your backend.
+        </p>
+
+        <div className="nutrient-edit-grid">
+          {Object.entries(nutrients)
+            .filter(
+              ([, value]) =>
+                value === null ||
+                ["string", "number"].includes(typeof value)
+            )
+            .map(([name, value]) => (
+              <form
+                className="nutrient-edit-card"
+                key={name}
+                onSubmit={(event) => {
+                  event.preventDefault();
+
+                  const formData = new FormData(
+                    event.currentTarget
+                  );
+
+                  handleNutrient(
+                    name,
+                    formData.get("value")
+                  );
+                }}
+              >
+                <label className="field">
+                  <span>{formatLabel(name)}</span>
+
+                  <input
+                    name="value"
+                    type="number"
+                    step="any"
+                    defaultValue={value ?? ""}
+                    required
+                  />
+                </label>
+
+                <button
+                  className="button button-primary"
+                  type="submit"
+                  disabled={busy === `nutrient-${name}`}
+                >
+                  {busy === `nutrient-${name}`
+                    ? "Saving…"
+                    : "Update"}
+                </button>
+              </form>
+            ))}
+        </div>
+      </section>
+    </>
+  );
+
+  const renderControl = () => (
+    <>
+      <SectionHeading
+        eyebrow="SYSTEM MANAGEMENT"
+        title="Control Center"
+        description="Choose which part of your hydroponics system to manage."
+      />
+
+      <div className="control-tabs">
+        <button
+          type="button"
+          className={`control-tab ${
+            controlPage === "environment" ? "active" : ""
+          }`}
+          onClick={() => setControlPage("environment")}
+        >
+          🌿 Environment Control
+        </button>
+
+        <button
+          type="button"
+          className={`control-tab ${
+            controlPage === "tank" ? "active" : ""
+          }`}
+          onClick={() => setControlPage("tank")}
+        >
+          💧 Tank Control
+        </button>
+      </div>
+
+      {controlPage === "environment"
+        ? renderEnvironmentControl()
+        : renderTankControl()}
+    </>
+  );
+
+  // ----------------------------------------------------------
+  // CALIBRATION PAGE
+  // ----------------------------------------------------------
+
+  const renderCalibration = () => (
+    <>
+      <SectionHeading
+        eyebrow="SENSOR MAINTENANCE"
+        title="Sensor Calibration"
+        description="Manage pH, EC and water temperature correction offsets."
+      />
+
+      <section className="panel">
+        <div className="inline-actions">
+          <h3 className="panel-title">
+            Calibration Values
+          </h3>
+
+          <button
+            className="button button-secondary"
+            type="button"
+            onClick={loadCalibration}
+            disabled={busy === "calibration-load"}
+          >
+            {busy === "calibration-load"
+              ? "Loading…"
+              : "Load values"}
+          </button>
+        </div>
+
+        <p className="muted-text">
+          Calibration values are stored in your backend.
+          Your backend or sensor device must apply these offsets
+          for them to change measured readings.
+        </p>
+
+        <form
+          className="settings-form"
+          onSubmit={handleCalibrationSave}
+        >
+          {[
+            {
+              key: "ph_offset",
+              label: "pH Offset",
+              description:
+                "Correction added to measured pH.",
+            },
+            {
+              key: "ec_offset",
+              label: "EC Offset",
+              description:
+                "Correction added to conductivity.",
+            },
+            {
+              key: "temperature_offset",
+              label: "Temperature Offset",
+              description:
+                "Correction added to measured temperature.",
+            },
+          ].map((item) => (
+            <label className="field" key={item.key}>
+              <span>{item.label}</span>
+
+              <input
+                type="number"
+                step="any"
+                value={calibration[item.key] ?? 0}
+                onChange={(event) =>
+                  setCalibration((current) => ({
+                    ...current,
+                    [item.key]:
+                      event.target.value === ""
+                        ? ""
+                        : Number(event.target.value),
+                  }))
+                }
+              />
+
+              <small>{item.description}</small>
+            </label>
+          ))}
+
+          <button
+            className="button button-primary"
+            type="submit"
+            disabled={busy === "calibration-save"}
+          >
+            {busy === "calibration-save"
+              ? "Saving…"
+              : "Save calibration"}
+          </button>
+        </form>
+      </section>
+    </>
+  );
+
+  // ----------------------------------------------------------
+  // HISTORY PAGE
+  // ----------------------------------------------------------
+
+  const renderHistory = () => (
+    <>
+      <SectionHeading
+        eyebrow="STORED READINGS"
+        title="Sensor History"
+        description="Filter historical readings and review sensor data."
+      />
+
+      <section className="panel">
+        <form
+          className="history-filters"
+          onSubmit={loadHistory}
+        >
+          {[
+            ["from_date", "Start date", "date"],
+            ["to_date", "End date", "date"],
+            ["from_time", "Start time", "time"],
+            ["to_time", "End time", "time"],
+          ].map(([key, label, type]) => (
+            <label className="field" key={key}>
+              <span>{label}</span>
+
+              <input
+                type={type}
+                value={historyFilters[key]}
+                onChange={(event) =>
+                  setHistoryFilters((current) => ({
+                    ...current,
+                    [key]: event.target.value,
+                  }))
+                }
+              />
+            </label>
+          ))}
+
+          <button
+            className="button button-primary"
+            type="submit"
+            disabled={busy === "history"}
+          >
+            {busy === "history"
+              ? "Loading…"
+              : "Apply filters"}
+          </button>
+        </form>
+      </section>
+
+      <section className="panel">
+        <SectionHeading
+          eyebrow="DATA OVERVIEW"
+          title="Sensor Reading Distribution"
+          description="Historical record counts for each sensor."
+        />
+
+        {historySummary.length > 0 ? (
+          <div className="history-chart">
+            <ResponsiveContainer width="100%" height={320}>
+              <PieChart>
+                <Pie
+                  data={historySummary}
+                  dataKey="value"
+                  nameKey="name"
+                  cx="50%"
+                  cy="48%"
+                  outerRadius={105}
+                  innerRadius={48}
+                  paddingAngle={3}
+                  label={({ name, value }) =>
+                    `${name}: ${value}`
+                  }
+                >
+                  {historySummary.map((entry, index) => (
+                    <Cell
+                      key={entry.name}
+                      fill={
+                        HISTORY_COLORS[
+                          index % HISTORY_COLORS.length
+                        ]
+                      }
+                    />
+                  ))}
+                </Pie>
+
+                <Tooltip />
+                <Legend />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+        ) : (
+          <p className="muted-text">
+            Load sensor history to display the chart.
+          </p>
+        )}
+      </section>
+
+      <section className="panel">
+        <SectionHeading
+          eyebrow="READING LOG"
+          title={`Historical Records (${history.length})`}
+          description="Readings returned by your backend."
+        />
+
+        <div className="table-wrap">
+          <table className="history-table">
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+
+                {ALL_SENSORS.map((sensor) => (
+                  <th key={sensor.key}>
+                    {sensor.label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+
+            <tbody>
+              {history.map((record, index) => (
+                <tr
+                  key={record._id || record.id || index}
+                >
+                  <td>{formatTimestamp(record)}</td>
+
+                  {ALL_SENSORS.map((sensor) => (
+                    <td key={sensor.key}>
+                      {displayValue(
+                        getSensorValue(record, sensor),
+                        sensor.unit
+                      )}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+
+              {!history.length && (
+                <tr>
+                  <td colSpan={ALL_SENSORS.length + 1}>
+                    No records loaded. Select a date/time range
+                    and apply the filters.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </>
+  );
+
+  // ----------------------------------------------------------
+  // AUTHENTICATION CHECK
+  // ----------------------------------------------------------
+
+  if (authChecking) {
+    return (
+      <div className="login-screen">
+        <div className="login-card">
+          <div className="login-brand-icon">🌱</div>
+          <h2>Checking your session…</h2>
+          <p className="muted-text">Please wait.</p>
+        </div>
       </div>
     );
   }
 
+  if (!user) {
+    return (
+      <LoginScreen
+        onLogin={handleLogin}
+        busy={loginBusy}
+        error={loginError}
+      />
+    );
+  }
+
+  // ----------------------------------------------------------
+  // MAIN LAYOUT
+  // ----------------------------------------------------------
+
+  const pageTitles = {
+    dashboard: "Dashboard",
+    control:
+      controlPage === "tank"
+        ? "Tank Control"
+        : "Environment Control",
+    calibration: "Calibration",
+    history: "History",
+  };
+
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="logo-box">H</div>
-          <div className="brand-text">
-            <strong>HydroControl</strong>
-            <small>SMART HYDROPONICS</small>
+      {/* TOP HEADER AND COMPANY LOGOS */}
+
+      <header className="topbar">
+        <div className="brand-side">
+          <img
+            className="brand-logo"
+            src="/logo1.png"
+            alt="Company logo"
+            onError={(event) => {
+              event.currentTarget.style.visibility = "hidden";
+            }}
+          />
+
+          <div className="brand-copy">
+            <span className="brand-name">HYDRO</span>
+            <span className="brand-subtitle">
+              Hydroponics Control Center
+            </span>
           </div>
         </div>
 
-        <div className="nav-label">WORKSPACE</div>
+        <div className="topbar-right">
+          <span className="connection-pill">
+            <span className="status-dot" />
+            Live monitoring
+          </span>
 
-        <nav className="main-nav">
-          {[
-            { name: "Dashboard", icon: "▦" },
-            { name: "Environment Control", icon: "☼" },
-            { name: "Tank Control", icon: "◉" },
-            { name: "Automation", icon: "⚙" },
-          ].map((item) => (
-            <button
-              type="button"
-              key={item.name}
-              className={`nav-item ${page === item.name ? "active" : ""}`}
-              onClick={() => {
-                setPage(item.name);
-                setMessage("");
-              }}
-            >
-              <span className="nav-icon">{item.icon}</span>
-              <span>{item.name}</span>
-              {page === item.name && <span className="nav-arrow">›</span>}
-            </button>
-          ))}
-        </nav>
+          <span
+            className={`role-pill ${
+              admin ? "role-admin" : "role-operator"
+            }`}
+          >
+            {admin ? "Admin" : "Operator"}
+          </span>
 
-        <div className="sidebar-grow" />
-
-        <div className="sidebar-info">
-          <div className="sidebar-info-icon">♧</div>
-          <strong>One shade. Total control.</strong>
-          <p>Monitor your growing environment and nutrient tank.</p>
-        </div>
-
-        <div className="sidebar-bottom">
-          <div className="connection-status">
-            <i className={error ? "offline-dot" : ""} />
-            {error ? "API connection issue" : "API monitored"}
-          </div>
-          <small>HydroControl · v1.0</small>
-        </div>
-      </aside>
-
-      <main className="main-content">
-        <header className="topbar">
-          <div className="breadcrumb">
-            Workspace <span>/</span> {page}
-          </div>
-
-          <div className="topbar-right">
-            <span className={`system-chip ${error ? "chip-error" : ""}`}>
-              <i />
-              {error ? "Connection issue" : "Monitoring"}
+          <div className="user-menu">
+            <span className="user-name">
+              {user.username || user.name || "Admin"}
             </span>
 
             <button
-              type="button"
               className="button button-secondary logout-button"
-              onClick={logout}
+              type="button"
+              onClick={handleLogout}
             >
               Log out
             </button>
           </div>
-        </header>
 
-        <div className="page-content">
-          <div className="page-heading">
-            <div>
-              <div className="eyebrow">SMART HYDROPONICS SYSTEM</div>
-              <h1>{page}</h1>
-              <p>
-                {page === "Dashboard"
-                  ? "Your growing shade and nutrient tank at a glance."
-                  : page === "Environment Control"
-                    ? "Monitor and control your single growing shade."
-                    : page === "Tank Control"
-                      ? "Manage your nutrient solution and reservoir equipment."
-                      : "Configure automatic equipment thresholds."}
-              </p>
+          <img
+            className="brand-logo brand-logo-right"
+            src="/logo2.png"
+            alt="Project or institute logo"
+            onError={(event) => {
+              event.currentTarget.style.visibility = "hidden";
+            }}
+          />
+        </div>
+      </header>
+
+      <div className="app-layout">
+        {/* SIDEBAR */}
+
+        <aside className="sidebar">
+          <p className="sidebar-label">WORKSPACE</p>
+
+          <nav
+            className="sidebar-nav"
+            aria-label="Main navigation"
+          >
+            {NAV_ITEMS.map((item) => (
+              <div className="nav-group" key={item.key}>
+                <button
+                  type="button"
+                  className={`nav-item ${
+                    page === item.key ? "active" : ""
+                  }`}
+                  onClick={() => {
+                    if (item.key === "control") {
+                      setControlExpanded((current) => !current);
+                      setPage("control");
+                      setError("");
+                      setNotice("");
+                    } else {
+                      navigate(item.key);
+                    }
+                  }}
+                >
+                  <span className="nav-icon">
+                    {item.icon}
+                  </span>
+
+                  <span className="nav-label">
+                    {item.label}
+                  </span>
+
+                  {item.key === "control" && (
+                    <span className="nav-chevron">
+                      {controlExpanded ? "⌄" : "›"}
+                    </span>
+                  )}
+                </button>
+
+                {item.key === "control" &&
+                  controlExpanded && (
+                    <div className="subnav">
+                      <button
+                        type="button"
+                        className={`subnav-item ${
+                          page === "control" &&
+                          controlPage === "environment"
+                            ? "active"
+                            : ""
+                        }`}
+                        onClick={() =>
+                          openControl("environment")
+                        }
+                      >
+                        <span>🌿</span>
+                        Environment Control
+                      </button>
+
+                      <button
+                        type="button"
+                        className={`subnav-item ${
+                          page === "control" &&
+                          controlPage === "tank"
+                            ? "active"
+                            : ""
+                        }`}
+                        onClick={() => openControl("tank")}
+                      >
+                        <span>💧</span>
+                        Tank Control
+                      </button>
+                    </div>
+                  )}
+              </div>
+            ))}
+          </nav>
+
+          <div className="sidebar-bottom">
+            <div className="sidebar-status">
+              <span className="status-dot" />
+
+              <div>
+                <strong>HydroControl</strong>
+                <small>Refreshes every 5 seconds</small>
+              </div>
             </div>
+          </div>
+        </aside>
 
-            <button
-              type="button"
-              className="button button-secondary refresh-button"
-              onClick={refreshData}
-              disabled={loading}
-            >
-              ↻ Refresh data
-            </button>
+        {/* MAIN CONTENT */}
+
+        <main className="main-content">
+          <div className="page-topline">
+            <span>
+              Workspace / {pageTitles[page]}
+            </span>
+
+            <span className="date-label">
+              {new Date().toLocaleDateString("en-IN", {
+                day: "2-digit",
+                month: "short",
+                year: "numeric",
+              })}
+            </span>
           </div>
 
-          {(error || message) && (
-            <div className={`notice ${error ? "notice-error" : ""}`}>
-              <span>{error || message}</span>
+          {error && (
+            <div className="alert alert-error" role="alert">
+              <span>{error}</span>
+
               <button
                 type="button"
-                aria-label="Dismiss notification"
-                onClick={() => {
-                  setError("");
-                  setMessage("");
-                }}
+                onClick={() => setError("")}
+                aria-label="Dismiss error"
               >
                 ×
               </button>
             </div>
           )}
 
-          {loading && (
-            <div className="loading-note">
-              <span className="loading-spinner" />
-              Connecting to HydroControl API...
+          {notice && (
+            <div
+              className="alert alert-success"
+              role="status"
+            >
+              <span>{notice}</span>
+
+              <button
+                type="button"
+                onClick={() => setNotice("")}
+                aria-label="Dismiss message"
+              >
+                ×
+              </button>
             </div>
           )}
 
-          {page === "Dashboard" && (
-            <>
-              <section className="welcome-banner">
-                <div className="welcome-copy">
-                  <span className="banner-kicker">
-                    YOUR SMART GROWING SPACE
-                  </span>
-                  <h2>
-                    Grow smarter.
-                    <br />
-                    Monitor better.
-                  </h2>
-                  <p>
-                    All your important hydroponics readings in one place.
-                    One growing shade, one connected dashboard.
-                  </p>
-                  <button
-                    type="button"
-                    className="button banner-button"
-                    onClick={() => setPage("Environment Control")}
-                  >
-                    View environment <span>→</span>
-                  </button>
-                </div>
+          {page === "dashboard" && renderDashboard()}
+          {page === "control" && renderControl()}
+          {page === "calibration" && renderCalibration()}
+          {page === "history" && renderHistory()}
 
-                <div className="banner-graphic" aria-hidden="true">
-                  <div className="plant-circle circle-back" />
-                  <div className="plant-circle circle-front">
-                    <span>♧</span>
-                  </div>
-                  <div className="banner-sparkle sparkle-one">✦</div>
-                  <div className="banner-sparkle sparkle-two">✧</div>
-                  <div className="banner-leaf">♧</div>
-                </div>
-              </section>
-
-              <div className="section-heading">
-                <div>
-                  <h2>Growing Shade</h2>
-                  <p>Your single shade's live environmental readings.</p>
-                </div>
-                <span className={`live-tag ${error ? "offline" : ""}`}>
-                  <i />
-                  {error ? "OFFLINE" : "LIVE"}
-                </span>
-              </div>
-
-              <div className="shade-grid">
-                {renderShade("shade_1", shade1)}
-              </div>
-
-              <div className="section-heading">
-                <div>
-                  <h2>Nutrient Tank Overview</h2>
-                  <p>Live reservoir readings and water-level status.</p>
-                </div>
-                <span className={`live-tag ${error ? "offline" : ""}`}>
-                  <i />
-                  {error ? "OFFLINE" : "LIVE"}
-                </span>
-              </div>
-
-              <div className="tank-overview-grid">
-                <section className="panel tank-visual-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <span className="eyebrow">RESERVOIR MONITOR</span>
-                      <h2>Water Level</h2>
-                    </div>
-                    <span className="tank-mini-icon">♧</span>
-                  </div>
-
-                  <div className="water-visual">
-                    <div className="water-tank">
-                      <div
-                        className="water-fill"
-                        style={{ height: `${waterPercent}%` }}
-                      >
-                        <div className="water-wave wave-one" />
-                        <div className="water-wave wave-two" />
-                      </div>
-                      <div className="water-label">
-                        <strong>
-                          {validWaterLevel ? `${number(waterLevel, 0)}%` : "--"}
-                        </strong>
-                        <span>water level</span>
-                      </div>
-                    </div>
-
-                    <div className="water-status">
-                      <span className="water-status-dot" />
-                      <div>
-                        <strong>{waterLevelText}</strong>
-                        <span>Reservoir status</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <button
-                    type="button"
-                    className="button button-secondary full-width"
-                    onClick={() => setPage("Tank Control")}
-                  >
-                    Open Tank Control →
-                  </button>
-                </section>
-
-                <section className="panel tank-readings-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <span className="eyebrow">SOLUTION QUALITY</span>
-                      <h2>Tank Readings</h2>
-                    </div>
-                    <span className="tank-mini-icon">◉</span>
-                  </div>
-
-                  <div className="reading-row">
-                    <div className="reading-icon temp-reading">♨</div>
-                    <div className="reading-copy">
-                      <span>Tank temperature</span>
-                      <strong>{number(tank.tank_temperature)} °C</strong>
-                    </div>
-                    <span className="reading-indicator" />
-                  </div>
-
-                  <div className="reading-row">
-                    <div className="reading-icon ph-reading">pH</div>
-                    <div className="reading-copy">
-                      <span>Nutrient pH</span>
-                      <strong>{number(tank.nutrient_ph, 2)}</strong>
-                    </div>
-                    <span className="reading-indicator" />
-                  </div>
-
-                  <div className="reading-row">
-                    <div className="reading-icon ec-reading">EC</div>
-                    <div className="reading-copy">
-                      <span>Electrical conductivity</span>
-                      <strong>{number(tank.nutrient_ec, 2)} mS/cm</strong>
-                    </div>
-                    <span className="reading-indicator" />
-                  </div>
-
-                  <button
-                    type="button"
-                    className="button button-primary full-width"
-                    onClick={() => setPage("Tank Control")}
-                  >
-                    View all tank controls →
-                  </button>
-                </section>
-              </div>
-
-              <div className="section-heading">
-                <div>
-                  <h2>Environment Summary</h2>
-                  <p>A quick summary of Shade 1.</p>
-                </div>
-              </div>
-
-              <div className="summary-grid">
-                <article className="summary-card">
-                  <div className="summary-icon temperature-icon">♨</div>
-                  <span>Shade temperature</span>
-                  <strong>{number(avgTemperature)} °C</strong>
-                  <small>Live sensor reading</small>
-                </article>
-
-                <article className="summary-card">
-                  <div className="summary-icon humidity-icon">◉</div>
-                  <span>Shade humidity</span>
-                  <strong>{number(avgHumidity, 0)}%</strong>
-                  <small>Live sensor reading</small>
-                </article>
-
-                <article className="summary-card">
-                  <div className="summary-icon light-icon">☼</div>
-                  <span>Light intensity</span>
-                  <strong>{number(shade1.light_intensity, 0)}</strong>
-                  <small>Shade 1 sensor</small>
-                </article>
-              </div>
-
-              <div className="dashboard-action-row">
-                <div>
-                  <strong>Need to adjust your growing environment?</strong>
-                  <p>Open the device controls for your shade.</p>
-                </div>
-                <button
-                  type="button"
-                  className="button button-primary"
-                  onClick={() => setPage("Environment Control")}
-                >
-                  Environment Control →
-                </button>
-              </div>
-
-              <p className="last-updated">
-                Last API update: {lastUpdated || "Waiting for data"}
-                <span> · Refreshes every 5 seconds</span>
-              </p>
-            </>
-          )}
-
-          {page === "Environment Control" && (
-            <>
-              <div className="section-heading">
-                <div>
-                  <h2>Shade 1 Sensor Monitor</h2>
-                  <p>Live environmental readings from your one shade.</p>
-                </div>
-                <span className={`live-tag ${error ? "offline" : ""}`}>
-                  <i />
-                  {error ? "OFFLINE" : "LIVE"}
-                </span>
-              </div>
-
-              <div className="environment-metric-grid">
-                <article className="environment-metric-card">
-                  <div className="metric-top">
-                    <div className="metric-icon temperature-icon">♨</div>
-                    <span>01</span>
-                  </div>
-                  <span>Temperature</span>
-                  <strong>{number(shade1.temperature)} <small>°C</small></strong>
-                  <div className="metric-track">
-                    <div
-                      className="metric-track-fill temp-fill"
-                      style={{
-                        width: `${
-                          shade1.temperature == null
-                            ? 0
-                            : Math.max(
-                                0,
-                                Math.min(100, Number(shade1.temperature) * 2)
-                              )
-                        }%`,
-                      }}
-                    />
-                  </div>
-                  <p>Growing-area temperature</p>
-                </article>
-
-                <article className="environment-metric-card">
-                  <div className="metric-top">
-                    <div className="metric-icon humidity-icon">◉</div>
-                    <span>02</span>
-                  </div>
-                  <span>Humidity</span>
-                  <strong>{number(shade1.humidity, 0)} <small>%</small></strong>
-                  <div className="metric-track">
-                    <div
-                      className="metric-track-fill humidity-fill"
-                      style={{
-                        width: `${
-                          shade1.humidity == null
-                            ? 0
-                            : Math.max(
-                                0,
-                                Math.min(100, Number(shade1.humidity))
-                              )
-                        }%`,
-                      }}
-                    />
-                  </div>
-                  <p>Relative humidity</p>
-                </article>
-
-                <article className="environment-metric-card">
-                  <div className="metric-top">
-                    <div className="metric-icon light-icon">☼</div>
-                    <span>03</span>
-                  </div>
-                  <span>Light intensity</span>
-                  <strong>{number(shade1.light_intensity, 0)}</strong>
-                  <div className="metric-track">
-                    <div
-                      className="metric-track-fill light-fill"
-                      style={{
-                        width: `${
-                          shade1.light_intensity == null
-                            ? 0
-                            : Math.max(
-                                0,
-                                Math.min(
-                                  100,
-                                  Number(shade1.light_intensity) / 100
-                                )
-                              )
-                        }%`,
-                      }}
-                    />
-                  </div>
-                  <p>Sensor-reported light value</p>
-                </article>
-              </div>
-
-              <div className="section-heading">
-                <div>
-                  <h2>Environment Devices</h2>
-                  <p>Send manual commands to your backend controller.</p>
-                </div>
-              </div>
-
-              <div className="device-grid">
-                {DEVICES.filter(
-                  (device) => device.group === "environment"
-                ).map(renderDevice)}
-              </div>
-            </>
-          )}
-
-          {page === "Tank Control" && (
-            <>
-              <div className="section-heading">
-                <div>
-                  <h2>Nutrient Tank Monitor</h2>
-                  <p>Reservoir readings and solution status.</p>
-                </div>
-                <span className={`live-tag ${error ? "offline" : ""}`}>
-                  <i />
-                  {error ? "OFFLINE" : "LIVE"}
-                </span>
-              </div>
-
-              <div className="tank-overview-grid tank-control-overview">
-                <section className="panel tank-visual-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <span className="eyebrow">WATER RESERVOIR</span>
-                      <h2>Water Level</h2>
-                    </div>
-                  </div>
-
-                  <div className="water-visual">
-                    <div className="water-tank">
-                      <div
-                        className="water-fill"
-                        style={{ height: `${waterPercent}%` }}
-                      >
-                        <div className="water-wave wave-one" />
-                        <div className="water-wave wave-two" />
-                      </div>
-                      <div className="water-label">
-                        <strong>
-                          {validWaterLevel ? `${number(waterLevel, 0)}%` : "--"}
-                        </strong>
-                        <span>water level</span>
-                      </div>
-                    </div>
-
-                    <div className="water-status">
-                      <span className="water-status-dot" />
-                      <div>
-                        <strong>{waterLevelText}</strong>
-                        <span>Reservoir status</span>
-                      </div>
-                    </div>
-                  </div>
-                </section>
-
-                <section className="panel tank-readings-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <span className="eyebrow">SOLUTION PARAMETERS</span>
-                      <h2>Live Readings</h2>
-                    </div>
-                  </div>
-
-                  <div className="reading-row">
-                    <div className="reading-icon temp-reading">♨</div>
-                    <div className="reading-copy">
-                      <span>Tank temperature</span>
-                      <strong>{number(tank.tank_temperature)} °C</strong>
-                    </div>
-                  </div>
-
-                  <div className="reading-row">
-                    <div className="reading-icon ph-reading">pH</div>
-                    <div className="reading-copy">
-                      <span>Nutrient pH</span>
-                      <strong>{number(tank.nutrient_ph, 2)}</strong>
-                    </div>
-                  </div>
-
-                  <div className="reading-row">
-                    <div className="reading-icon ec-reading">EC</div>
-                    <div className="reading-copy">
-                      <span>Electrical conductivity</span>
-                      <strong>{number(tank.nutrient_ec, 2)} mS/cm</strong>
-                    </div>
-                  </div>
-                </section>
-              </div>
-
-              <div className="section-heading">
-                <div>
-                  <h2>Tank Equipment</h2>
-                  <p>Control the pumps connected to your controller.</p>
-                </div>
-              </div>
-
-              <div className="device-grid">
-                {DEVICES.filter(
-                  (device) => device.group === "tank"
-                ).map(renderDevice)}
-              </div>
-
-              <div className="section-heading">
-                <div>
-                  <h2>Nutrient Dosing</h2>
-                  <p>Configure nutrient A, B and C dosing rates.</p>
-                </div>
-              </div>
-
-              <div className="nutrient-grid">
-                {["A", "B", "C"].map(renderDose)}
-              </div>
-            </>
-          )}
-
-          {page === "Automation" && (
-            <>
-              <div className="automation-intro">
-                <div className="automation-intro-icon">⚙</div>
-                <div>
-                  <h2>Smart Automation</h2>
-                  <p>
-                    Set the thresholds your backend should use to control
-                    equipment automatically.
-                  </p>
-                </div>
-              </div>
-
-              <section className="panel automation-panel">
-                <div className="panel-heading">
-                  <div>
-                    <span className="eyebrow">AUTOMATION RULES</span>
-                    <h2>Temperature & Humidity Thresholds</h2>
-                    <p>Set separate activation and deactivation values.</p>
-                  </div>
-                </div>
-
-                <form onSubmit={submitAutomation}>
-                  {[
-                    ["fan_on", "Fan ON temperature", "°C"],
-                    ["fan_off", "Fan OFF temperature", "°C"],
-                    ["cooling_on", "Cooling ON temperature", "°C"],
-                    ["cooling_off", "Cooling OFF temperature", "°C"],
-                    ["fogger_on", "Fogger ON humidity", "%"],
-                    ["fogger_off", "Fogger OFF humidity", "%"],
-                  ].map(([key, label, unit]) => (
-                    <label className="form-field" key={key}>
-                      <span>{label}</span>
-                      <div className="input-with-unit">
-                        <input
-                          type="number"
-                          step="0.1"
-                          value={automation[key]}
-                          onChange={(event) =>
-                            setAutomation((old) => ({
-                              ...old,
-                              [key]: event.target.value,
-                            }))
-                          }
-                          required
-                        />
-                        <span>{unit}</span>
-                      </div>
-                    </label>
-                  ))}
-
-                  <div className="automation-form-footer">
-                    <p>
-                      Check that each ON/OFF pair has a valid threshold gap.
-                    </p>
-                    <button
-                      type="submit"
-                      className="button button-primary"
-                      disabled={busy === "automation"}
-                    >
-                      {busy === "automation"
-                        ? "Saving settings..."
-                        : "Save automation settings"}
-                    </button>
-                  </div>
-                </form>
-              </section>
-
-              <div className="notice automation-notice">
-                <span>
-                  Saving thresholds sends settings to your API. Automatic
-                  physical control requires the backend and Raspberry Pi
-                  automation logic to be implemented.
-                </span>
-              </div>
-            </>
-          )}
-
-          <footer className="page-footer">
-            <span>HydroControl · Hydroponics monitoring</span>
+          <footer className="app-footer">
             <span>
-              {loading
-                ? "Connecting..."
-                : error
-                  ? "Connection issue"
-                  : `Last updated ${lastUpdated || "waiting for data"}`}
+              HYDRO · Hydroponics Monitoring System
+            </span>
+
+            <span>
+              Monitoring and control dashboard
             </span>
           </footer>
-        </div>
-      </main>
+        </main>
+      </div>
     </div>
   );
 }
