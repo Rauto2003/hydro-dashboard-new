@@ -3,6 +3,7 @@ import os
 from copy import deepcopy
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
+from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -17,19 +18,17 @@ from pymongo.errors import PyMongoError
 
 load_dotenv()
 
-MONGODB_URI = os.getenv(
-    "MONGODB_URI",
-    "mongodb://localhost:27017/",
-)
-MONGODB_DATABASE = os.getenv(
-    "MONGODB_DATABASE",
-    "hydroponics",
-)
+MONGODB_URI = os.getenv("MONGODB_URI")
+MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "hydroponics")
+
+if not MONGODB_URI:
+    raise RuntimeError(
+        "MONGODB_URI is missing from backend/.env"
+    )
 
 client = MongoClient(
     MONGODB_URI,
-    serverSelectionTimeoutMS=3000,
-    connectTimeoutMS=3000,
+    serverSelectionTimeoutMS=10000,
     tz_aware=True,
 )
 
@@ -59,28 +58,24 @@ DEFAULT_SENSOR_DATA = {
     "nutrient_tank": deepcopy(DEFAULT_TANK),
     "water_temperature": None,
     "ph_level": None,
-    "nutrient_ph": None,
-    "ph": None,
     "electrical_conductivity": None,
-    "nutrient_ec": None,
-    "ec": None,
     "water_level": None,
 }
 
 DEFAULT_STATES = {
-    "nutrients": {"A": 0, "B": 0, "C": 0},
+    "nutrients": {
+        "A": 0,
+        "B": 0,
+        "C": 0,
+    },
     "actuators": {},
     "automation_settings": {},
-    "calibration": {
-        "ph_offset": 0.0,
-        "ec_offset": 0.0,
-        "temperature_offset": 0.0,
-    },
+    "calibration": {},
 }
 
 
 # =========================================================
-# MONGODB HELPERS
+# HELPERS
 # =========================================================
 
 def utc_now():
@@ -107,18 +102,33 @@ def save_state(key, value):
     )
 
 
-# =========================================================
-# SENSOR NORMALIZATION
-# =========================================================
-
 def flatten_dashboard_payload(data):
-    """Accept flat JSON and dashboard-style nested readings."""
+    """
+    Accept the dashboard JSON structure:
+
+    {
+      "tank_parameters": {
+        "readings": [
+          {"key": "water_temperature", "value": 25.5}
+        ]
+      },
+      "growing_environment": {
+        "readings": [
+          {"key": "humidity", "value": 68}
+        ]
+      }
+    }
+
+    Also accepts a normal flat sensor payload.
+    """
     result = dict(data)
 
-    for section_name in (
+    sections = (
         "tank_parameters",
         "growing_environment",
-    ):
+    )
+
+    for section_name in sections:
         section = result.get(section_name)
 
         if not isinstance(section, dict):
@@ -142,29 +152,50 @@ def flatten_dashboard_payload(data):
 
 
 def normalize_sensor_payload(data, previous):
+    """
+    Normalize dashboard and hardware payloads to one schema.
+
+    Canonical fields:
+      shades.shade_1.temperature
+      shades.shade_1.humidity
+      nutrient_tank.tank_temperature
+      nutrient_tank.nutrient_ph
+      nutrient_tank.nutrient_ec
+      nutrient_tank.water_level
+
+    Unsent values are preserved from the previous reading.
+    Explicitly supplied null values remain null.
+    """
+
     data = flatten_dashboard_payload(data)
     merged = dict(previous)
     merged.update(data)
 
-    # Growing environment
+    # -----------------------------------------------------
+    # GROWING SHED / SHADES
+    # -----------------------------------------------------
+
     shades = deepcopy(previous.get("shades") or {})
     incoming_shades = data.get("shades")
 
     if isinstance(incoming_shades, dict):
-        for name, values in incoming_shades.items():
-            if isinstance(values, dict):
-                existing = dict(shades.get(name) or {})
-                existing.update(values)
-                shades[name] = existing
+        for shade_name, shade_values in incoming_shades.items():
+            if isinstance(shade_values, dict):
+                existing = dict(shades.get(shade_name) or {})
+                existing.update(shade_values)
+                shades[shade_name] = existing
             else:
-                shades[name] = values
+                shades[shade_name] = shade_values
 
     shade_1 = dict(shades.get("shade_1") or {})
 
+    # Accept both shed_temperature and temperature.
     if "shed_temperature" in data:
         shed_temperature = data["shed_temperature"]
+        shade_1["temperature"] = shed_temperature
     elif "temperature" in data:
         shed_temperature = data["temperature"]
+        shade_1["temperature"] = shed_temperature
     else:
         shed_temperature = shade_1.get(
             "temperature",
@@ -173,17 +204,12 @@ def normalize_sensor_payload(data, previous):
 
     if "humidity" in data:
         humidity = data["humidity"]
+        shade_1["humidity"] = humidity
     else:
         humidity = shade_1.get(
             "humidity",
             previous.get("humidity"),
         )
-
-    if shed_temperature is not None:
-        shade_1["temperature"] = shed_temperature
-
-    if humidity is not None:
-        shade_1["humidity"] = humidity
 
     if "light_intensity" in data:
         shade_1["light_intensity"] = data["light_intensity"]
@@ -191,45 +217,49 @@ def normalize_sensor_payload(data, previous):
     if shade_1:
         shades["shade_1"] = shade_1
 
-    # Nutrient tank
+    # -----------------------------------------------------
+    # NUTRIENT TANK
+    # -----------------------------------------------------
+
     tank = deepcopy(
         previous.get("nutrient_tank") or DEFAULT_TANK
     )
 
+    # Ensure all expected tank keys exist.
     for key, value in DEFAULT_TANK.items():
         tank.setdefault(key, value)
-
-    aliases = {
-        "water_temperature": "tank_temperature",
-        "tank_temperature": "tank_temperature",
-        "temperature": "tank_temperature",
-        "ph_level": "nutrient_ph",
-        "nutrient_ph": "nutrient_ph",
-        "ph": "nutrient_ph",
-        "pH": "nutrient_ph",
-        "electrical_conductivity": "nutrient_ec",
-        "nutrient_ec": "nutrient_ec",
-        "ec": "nutrient_ec",
-        "EC": "nutrient_ec",
-        "water_level": "water_level",
-    }
 
     incoming_tank = data.get("nutrient_tank")
 
     if isinstance(incoming_tank, dict):
+        nested_aliases = {
+            "water_temperature": "tank_temperature",
+            "ph_level": "nutrient_ph",
+            "electrical_conductivity": "nutrient_ec",
+        }
+
         for key, value in incoming_tank.items():
-            normalized_key = aliases.get(key, key)
+            normalized_key = nested_aliases.get(key, key)
+            tank[normalized_key] = value
 
-            if normalized_key in DEFAULT_TANK:
-                tank[normalized_key] = value
+    # Flat dashboard fields and flat hardware fields.
+    flat_aliases = {
+        "water_temperature": "tank_temperature",
+        "tank_temperature": "tank_temperature",
+        "ph_level": "nutrient_ph",
+        "nutrient_ph": "nutrient_ph",
+        "electrical_conductivity": "nutrient_ec",
+        "nutrient_ec": "nutrient_ec",
+        "water_level": "water_level",
+    }
 
-    for incoming_key, tank_key in aliases.items():
+    for incoming_key, tank_key in flat_aliases.items():
         if incoming_key in data:
             tank[tank_key] = data[incoming_key]
 
-    # Do not let a tank temperature overwrite the shed temperature.
-    if "temperature" not in data and "shed_temperature" not in data:
-        merged["temperature"] = previous.get("temperature")
+    # -----------------------------------------------------
+    # CONSISTENT RESPONSE
+    # -----------------------------------------------------
 
     merged["temperature"] = shed_temperature
     merged["shed_temperature"] = shed_temperature
@@ -237,15 +267,11 @@ def normalize_sensor_payload(data, previous):
     merged["shades"] = shades
     merged["nutrient_tank"] = tank
 
-    # Frontend-compatible aliases
-    merged["water_temperature"] = tank["tank_temperature"]
-    merged["ph_level"] = tank["nutrient_ph"]
-    merged["nutrient_ph"] = tank["nutrient_ph"]
-    merged["ph"] = tank["nutrient_ph"]
-    merged["electrical_conductivity"] = tank["nutrient_ec"]
-    merged["nutrient_ec"] = tank["nutrient_ec"]
-    merged["ec"] = tank["nutrient_ec"]
-    merged["water_level"] = tank["water_level"]
+    # Dashboard-friendly aliases.
+    merged["water_temperature"] = tank.get("tank_temperature")
+    merged["ph_level"] = tank.get("nutrient_ph")
+    merged["electrical_conductivity"] = tank.get("nutrient_ec")
+    merged["water_level"] = tank.get("water_level")
 
     return merged
 
@@ -266,25 +292,23 @@ def latest_sensor_data():
     tank = deepcopy(DEFAULT_TANK)
     tank.update(row.get("nutrient_tank") or {})
 
-    timestamp = row.get("timestamp")
     temperature = row.get("temperature")
     humidity = row.get("humidity")
+    timestamp = row.get("timestamp")
 
     result.update({
         "temperature": temperature,
         "shed_temperature": temperature,
         "humidity": humidity,
-        "timestamp": timestamp.isoformat() if timestamp else None,
+        "timestamp": (
+            timestamp.isoformat() if timestamp else None
+        ),
         "shades": row.get("shades") or {},
         "nutrient_tank": tank,
-        "water_temperature": tank["tank_temperature"],
-        "ph_level": tank["nutrient_ph"],
-        "nutrient_ph": tank["nutrient_ph"],
-        "ph": tank["nutrient_ph"],
-        "electrical_conductivity": tank["nutrient_ec"],
-        "nutrient_ec": tank["nutrient_ec"],
-        "ec": tank["nutrient_ec"],
-        "water_level": tank["water_level"],
+        "water_temperature": tank.get("tank_temperature"),
+        "ph_level": tank.get("nutrient_ph"),
+        "electrical_conductivity": tank.get("nutrient_ec"),
+        "water_level": tank.get("water_level"),
     })
 
     return result
@@ -297,23 +321,18 @@ def latest_sensor_data():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        # MongoDB being unavailable will not prevent /docs from opening.
-        try:
-            client.admin.command("ping")
-            readings.create_index([("timestamp", DESCENDING)])
+        client.admin.command("ping")
 
-            for key, value in DEFAULT_STATES.items():
-                app_state.update_one(
-                    {"_id": key},
-                    {"$setOnInsert": {"value": value}},
-                    upsert=True,
-                )
+        readings.create_index([
+            ("timestamp", DESCENDING),
+        ])
 
-            print("MongoDB connected successfully.")
-
-        except PyMongoError as exc:
-            print(f"MongoDB is not available yet: {exc}")
-            print("FastAPI will start, but database operations may fail.")
+        for key, value in DEFAULT_STATES.items():
+            app_state.update_one(
+                {"_id": key},
+                {"$setOnInsert": {"value": value}},
+                upsert=True,
+            )
 
         yield
 
@@ -323,25 +342,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Hydroponics Controller API",
-    version="5.0.0",
+    version="3.1.0",
     lifespan=lifespan,
 )
 
-cors_origins = [
-    origin.strip()
-    for origin in os.getenv(
-        "API_CORS_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-    ).split(",")
-    if origin.strip()
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -369,10 +379,10 @@ def database_health():
             "database": MONGODB_DATABASE,
         }
 
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
             status_code=503,
-            detail=f"MongoDB connection failed: {exc}",
+            detail="MongoDB connection failed",
         )
 
 
@@ -385,19 +395,15 @@ def get_sensor_data():
     try:
         return latest_sensor_data()
 
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
-            status_code=503,
-            detail=f"Could not retrieve sensor readings: {exc}",
+            status_code=500,
+            detail="Could not retrieve sensor readings",
         )
 
 
 @app.post("/api/sensors")
 def receive_sensor_data(data: dict):
-    """
-    Receive sensor JSON without login during local testing.
-    Saves readings in MongoDB.
-    """
     try:
         previous = latest_sensor_data()
         merged = normalize_sensor_payload(data, previous)
@@ -418,15 +424,15 @@ def receive_sensor_data(data: dict):
 
         return {
             "success": True,
-            "message": "Sensor readings saved to MongoDB.",
+            "message": "Sensor readings saved to MongoDB",
             "id": str(result.inserted_id),
             "received": merged,
         }
 
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
-            status_code=503,
-            detail=f"Could not save sensor reading to MongoDB: {exc}",
+            status_code=500,
+            detail="Could not save sensor reading to MongoDB",
         )
 
 
@@ -436,26 +442,28 @@ def receive_sensor_data(data: dict):
 
 @app.get("/api/sensors/history")
 def get_sensor_history(
-    from_date: date | None = Query(default=None),
-    to_date: date | None = Query(default=None),
-    from_time: time | None = Query(default=None),
-    to_time: time | None = Query(default=None),
+    from_date: Optional[date] = Query(default=None),
+    to_date: Optional[date] = Query(default=None),
+    from_time: Optional[time] = Query(default=None),
+    to_time: Optional[time] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
 ):
     if from_date and to_date and from_date > to_date:
         raise HTTPException(
             status_code=400,
-            detail="from_date must not be after to_date.",
+            detail="from_date must not be after to_date",
         )
 
     if from_time and to_time and from_time > to_time:
         raise HTTPException(
             status_code=400,
-            detail="from_time must not be after to_time.",
+            detail="from_time must not be after to_time",
         )
 
     filters = {}
+
+    # Date filtering uses UTC calendar days.
     timestamp_filter = {}
 
     if from_date:
@@ -475,6 +483,7 @@ def get_sensor_history(
     if timestamp_filter:
         filters["timestamp"] = timestamp_filter
 
+    # Filter by UTC clock time in MongoDB before pagination.
     if from_time or to_time:
         clock_expression = {
             "$dateToString": {
@@ -484,10 +493,10 @@ def get_sensor_history(
             }
         }
 
-        conditions = []
+        clock_conditions = []
 
         if from_time:
-            conditions.append({
+            clock_conditions.append({
                 "$gte": [
                     clock_expression,
                     from_time.strftime("%H:%M:%S"),
@@ -495,7 +504,7 @@ def get_sensor_history(
             })
 
         if to_time:
-            conditions.append({
+            clock_conditions.append({
                 "$lte": [
                     clock_expression,
                     to_time.strftime("%H:%M:%S"),
@@ -503,9 +512,9 @@ def get_sensor_history(
             })
 
         filters["$expr"] = (
-            conditions[0]
-            if len(conditions) == 1
-            else {"$and": conditions}
+            clock_conditions[0]
+            if len(clock_conditions) == 1
+            else {"$and": clock_conditions}
         )
 
     try:
@@ -530,8 +539,12 @@ def get_sensor_history(
 
             history.append({
                 "id": str(row["_id"]),
-                "time": timestamp.isoformat() if timestamp else None,
-                "timestamp": timestamp.isoformat() if timestamp else None,
+                "time": (
+                    timestamp.isoformat() if timestamp else None
+                ),
+                "timestamp": (
+                    timestamp.isoformat() if timestamp else None
+                ),
                 "temperature": row.get("temperature"),
                 "shed_temperature": row.get("temperature"),
                 "humidity": row.get("humidity"),
@@ -547,10 +560,10 @@ def get_sensor_history(
             "history": history,
         }
 
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
-            status_code=503,
-            detail=f"Could not retrieve sensor history: {exc}",
+            status_code=500,
+            detail="Could not retrieve sensor history",
         )
 
 
@@ -561,12 +574,14 @@ def get_sensor_history(
 @app.get("/api/nutrients")
 def get_nutrients():
     try:
-        return {"nutrients": get_state("nutrients")}
+        return {
+            "nutrients": get_state("nutrients"),
+        }
 
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
-            status_code=503,
-            detail=f"Could not retrieve nutrients: {exc}",
+            status_code=500,
+            detail="Could not retrieve nutrients",
         )
 
 
@@ -585,13 +600,13 @@ def set_nutrient(data: dict):
     except (TypeError, ValueError):
         raise HTTPException(
             status_code=400,
-            detail="Invalid nutrient value.",
+            detail="Invalid nutrient value",
         )
 
-    if not 0 <= value <= 100000:
+    if value < 0:
         raise HTTPException(
             status_code=400,
-            detail="Nutrient value must be between 0 and 100000.",
+            detail="Value cannot be negative",
         )
 
     try:
@@ -599,12 +614,15 @@ def set_nutrient(data: dict):
         values[name] = value
         save_state("nutrients", values)
 
-        return {"success": True, "nutrients": values}
+        return {
+            "success": True,
+            "nutrients": values,
+        }
 
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
-            status_code=503,
-            detail=f"Could not save nutrients: {exc}",
+            status_code=500,
+            detail="Could not save nutrients",
         )
 
 
@@ -615,12 +633,14 @@ def set_nutrient(data: dict):
 @app.get("/api/actuators")
 def get_actuators():
     try:
-        return {"actuators": get_state("actuators")}
+        return {
+            "actuators": get_state("actuators"),
+        }
 
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
-            status_code=503,
-            detail=f"Could not retrieve actuators: {exc}",
+            status_code=500,
+            detail="Could not retrieve actuators",
         )
 
 
@@ -632,19 +652,13 @@ def control_actuator(data: dict):
     if not name:
         raise HTTPException(
             status_code=400,
-            detail="Missing actuator name.",
+            detail="Missing actuator name",
         )
 
     if state not in ("ON", "OFF"):
         raise HTTPException(
             status_code=400,
-            detail="State must be ON or OFF.",
-        )
-
-    if len(name) > 100:
-        raise HTTPException(
-            status_code=400,
-            detail="Actuator name is too long.",
+            detail="State must be ON or OFF",
         )
 
     try:
@@ -657,15 +671,15 @@ def control_actuator(data: dict):
             "name": name,
             "state": state,
             "message": (
-                "Command stored in MongoDB. Physical hardware control "
-                "requires controller integration."
+                "Command stored in MongoDB. Physical hardware "
+                "control requires controller integration."
             ),
         }
 
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
-            status_code=503,
-            detail=f"Could not save actuator state: {exc}",
+            status_code=500,
+            detail="Could not save actuator state",
         )
 
 
@@ -676,40 +690,33 @@ def control_actuator(data: dict):
 @app.get("/api/automation")
 def get_automation():
     try:
-        return {"settings": get_state("automation_settings")}
+        return {
+            "settings": get_state("automation_settings"),
+        }
 
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
-            status_code=503,
-            detail=f"Could not retrieve automation settings: {exc}",
+            status_code=500,
+            detail="Could not retrieve automation settings",
         )
 
 
 @app.post("/api/automation")
 def save_automation(data: dict):
-    if not data:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide at least one automation setting.",
-        )
-
-    if len(data) > 100:
-        raise HTTPException(
-            status_code=400,
-            detail="Too many automation settings.",
-        )
-
     try:
         settings = dict(get_state("automation_settings"))
         settings.update(data)
         save_state("automation_settings", settings)
 
-        return {"success": True, "settings": settings}
+        return {
+            "success": True,
+            "settings": settings,
+        }
 
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
-            status_code=503,
-            detail=f"Could not save automation settings: {exc}",
+            status_code=500,
+            detail="Could not save automation settings",
         )
 
 
@@ -720,59 +727,51 @@ def save_automation(data: dict):
 @app.get("/api/calibration")
 def get_calibration():
     try:
-        calibration = deepcopy(DEFAULT_STATES["calibration"])
-        calibration.update(get_state("calibration"))
+        return {
+            "calibration": get_state("calibration"),
+        }
 
-        return {"calibration": calibration}
-
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
-            status_code=503,
-            detail=f"Could not retrieve calibration: {exc}",
+            status_code=500,
+            detail="Could not retrieve calibration settings",
         )
 
 
 @app.post("/api/calibration")
 def save_calibration(data: dict):
-    allowed_fields = {
-        "ph_offset",
-        "ec_offset",
-        "temperature_offset",
-    }
+    calibration = dict(get_state("calibration"))
+
+    for name, value in data.items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Calibration value for {name} "
+                    "must be numeric"
+                ),
+            )
+
+        if not name.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Calibration field name cannot be empty",
+            )
+
+        calibration[name] = number
 
     try:
-        calibration = deepcopy(DEFAULT_STATES["calibration"])
-        calibration.update(get_state("calibration"))
-
-        for name, value in data.items():
-            if name not in allowed_fields:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsupported calibration field: {name}",
-                )
-
-            try:
-                number = float(value)
-            except (TypeError, ValueError):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Calibration value for {name} must be numeric.",
-                )
-
-            if not -100000 <= number <= 100000:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Calibration value for {name} is out of range.",
-                )
-
-            calibration[name] = number
-
         save_state("calibration", calibration)
 
-        return {"success": True, "calibration": calibration}
+        return {
+            "success": True,
+            "calibration": calibration,
+        }
 
-    except PyMongoError as exc:
+    except PyMongoError:
         raise HTTPException(
-            status_code=503,
-            detail=f"Could not save calibration: {exc}",
+            status_code=500,
+            detail="Could not save calibration settings",
         )
